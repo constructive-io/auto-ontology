@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import pytest
 
-from auto_ontology.utils.sql_identifiers import qualified_name, quoted_identifier
+from auto_ontology.utils.sql_identifiers import (
+    needs_quoting,
+    qualified_name,
+    quoted_identifier,
+    quoted_if_needed,
+)
 
 
 @pytest.mark.parametrize(
@@ -38,3 +43,44 @@ def test_qualified_name_skips_empty_parts() -> None:
     assert qualified_name(None, "raw", "t", dialect="spark") == "`raw`.`t`"
     assert qualified_name(None, None, "t", dialect="spark") == "`t`"
     assert qualified_name("", "raw", "t", dialect="spark") == "`raw`.`t`"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "sales-data",
+        "01a1d278-8f97-7755-8907-45833c5c34a5",
+        "2024_orders",
+        "Sales Orders",
+        "kubeType",
+        "a.b",
+    ],
+)
+def test_names_that_cannot_be_written_bare_need_quoting(name: str) -> None:
+    for dialect in ("postgres", "spark", "mysql", None, "not-a-dialect"):
+        assert needs_quoting(name, dialect)
+
+
+@pytest.mark.parametrize("name", ["orders", "public", "order_items", "_tmp", "t1"])
+def test_plain_names_stay_bare(name: str) -> None:
+    for dialect in ("postgres", "spark", "mysql", None, "not-a-dialect"):
+        assert not needs_quoting(name, dialect)
+        assert quoted_if_needed(name, dialect) == name
+
+
+def test_reserved_words_follow_the_dialect() -> None:
+    # sqlglot knows MySQL reserves ``group``; the answer is the dialect's.
+    assert quoted_if_needed("group", "mysql") == "`group`"
+
+
+@pytest.mark.parametrize(
+    ("dialect", "expected"),
+    [
+        ("postgres", '"sales-data"'),
+        ("spark", "`sales-data`"),
+        ("mysql", "`sales-data`"),
+        ("not-a-dialect", '"sales-data"'),
+    ],
+)
+def test_quoted_if_needed_uses_the_dialect_quote(dialect: str, expected: str) -> None:
+    assert quoted_if_needed("sales-data", dialect) == expected

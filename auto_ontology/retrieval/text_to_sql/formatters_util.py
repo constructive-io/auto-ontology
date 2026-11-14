@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from auto_ontology.utils.sample_values import stringify_sample_values
+from auto_ontology.utils.sql_identifiers import quoted_if_needed
 
 
 def _format_sample_values(raw: Any) -> str:
@@ -118,6 +119,12 @@ def qualify_table(
     TABLE_OR_VIEW_NOT_FOUND. Scoping the session instead is not an option:
     Spark rejects ``USE CATALOG``, and ``SET CATALOG`` leaves
     ``current_schema()`` empty so the two-part name still does not resolve.
+
+    With a *dialect*, any part that cannot be written bare is quoted for it
+    (see :func:`auto_ontology.utils.sql_identifiers.needs_quoting`): a schema
+    ``sales-data`` renders as ``"sales-data".orders``, because the bare form
+    the model would copy is not a table reference at all. Without one the
+    result is a plain dotted name, usable as an identity key but not as SQL.
     """
     parts = [database_name, schema_name, table_name]
     collapsible = (dialect or "").lower() not in _CATALOG_QUALIFIED_DIALECTS
@@ -128,6 +135,8 @@ def qualify_table(
         and database_name.lower() == schema_name.lower()
     ):
         parts = [schema_name, table_name]
+    if dialect:
+        parts = [quoted_if_needed(part, dialect) for part in parts if part]
     return ".".join(part for part in parts if part)
 
 
@@ -148,6 +157,8 @@ def _hop_column(
     table = hop.get(f"{side}_table", "")
     column = hop.get(f"{side}_column", "")
     prefix = qualify_table(database, schema, table, dialect)
+    if dialect and column:
+        column = quoted_if_needed(column, dialect)
     return f"{prefix}.{column}"
 
 

@@ -62,6 +62,7 @@ from auto_ontology.retrieval.text_to_sql.state import (
     get_standalone_question,
 )
 from auto_ontology.utils.llm_invoke import invoke_with_structured_output
+from auto_ontology.utils.sql_identifiers import needs_quoting, quoted_if_needed
 
 logger = logging.getLogger(__name__)
 
@@ -258,24 +259,111 @@ def detect_degenerate_sql(sql: str, dialect: str | None = None) -> str:
     return ""
 
 
-def quote_known_mixed_case_identifiers(
-    sql: str, relevant_tables: list[dict] | None, dialect: str | None
-) -> str:
-    """Deterministically quote every table/column reference in *sql* that
-    exactly matches a known mixed-case identifier from *relevant_tables*, so
-    Postgres (and any other dialect with the same unquoted-lowercasing rule)
-    doesn't silently fold e.g. ``WeatherAndStructure`` to
-    ``weatherandstructure`` and fail with "relation does not exist".
+def _known_identifiers(
+    relevant_tables: list[dict], dialect: str | None, target_db: str | None
+) -> tuple[set[str], set[str], set[str], list[tuple[str, ...]]]:
+    """Collect the known names that :func:`needs_quoting` in *dialect*.
 
-    The model is shown these exact names in the AVAILABLE TABLES/COLUMNS
-    prompt section and told, via the dialect rules, to quote anything with
-    an uppercase letter — but that instruction competes against its
-    dominant prior from the mostly-lowercase rest of the schema corpus and
-    loses often enough to be worth enforcing deterministically, rather than
-    relying on compliance or on a failed execution + LLM reconstruction
-    round-trip to catch it after the fact (see ``sql_reconstruction.py``,
-    which still exists as a fallback for anything this misses — e.g. an
-    identifier not in ``relevant_tables`` at all).
+    Returns the qualifiers (catalog/database and schema names), table names and
+    column names that need it, plus every ``[database.]schema.table`` path with
+    at least one such part, longest first.
+    """
+    qualifiers: set[str] = set()
+    tables: set[str] = set()
+    columns: set[str] = set()
+    paths: set[tuple[str, ...]] = set()
+    for table in relevant_tables:
+        if not isinstance(table, dict):
+            continue
+        name = table.get("name") or ""
+        schema = table.get("schema_name") or ""
+        database = table.get("database_name") or target_db or ""
+        if name and needs_quoting(name, dialect):
+            tables.add(name)
+        qualifiers.update(
+            part for part in (database, schema) if part and needs_quoting(part, dialect)
+        )
+        if name and schema:
+            for path in ((database, schema, name), (schema, name)):
+                if all(path) and any(needs_quoting(part, dialect) for part in path):
+                    paths.add(path)
+        cols = table.get("columns")
+        for col in cols if isinstance(cols, list) else []:
+            col_name = col.get("name") if isinstance(col, dict) else None
+            if col_name and needs_quoting(col_name, dialect):
+                columns.add(col_name)
+    ordered = sorted(paths, key=lambda path: -len(".".join(path)))
+    return qualifiers, tables, columns, ordered
+
+
+def _quote_bare_table_paths(
+    sql: str, paths: list[tuple[str, ...]], dialect: str | None
+) -> str:
+    """Quote each known table path that *sql* spells out bare.
+
+    This runs on the text, before parsing, because the names it exists for are
+    the ones that make the statement unparseable: a bare ``sales-data.orders``
+    is a subtraction, and a bare UUID database name is not even an expression.
+    The dialect's own tokenizer decides where a match may sit -- it has to be
+    made of whole, unquoted tokens, so a string literal, a comment, an already
+    quoted name or a longer identifier that merely contains the path is never
+    touched.
+    """
+    for path in paths:
+        bare = ".".join(path)
+        if bare not in sql:
+            continue
+        try:
+            tokens = sqlglot.tokenize(sql, read=dialect or None)
+        except Exception:
+            return sql
+        # Token start -> end, for tokens written exactly as their text; string
+        # literals and quoted identifiers carry delimiters and drop out here.
+        ends = {
+            token.start: token.end + 1
+            for token in tokens
+            if sql[token.start : token.end + 1] == token.text
+        }
+        quoted = ".".join(quoted_if_needed(part, dialect) for part in path)
+        start = sql.rfind(bare)
+        while start != -1:
+            stop = start + len(bare)
+            pos = start
+            while pos < stop and pos in ends:
+                pos = ends[pos]
+            if pos == stop and (start == 0 or sql[start - 1] in " \t\r\n(,."):
+                sql = sql[:start] + quoted + sql[stop:]
+            start = sql.rfind(bare, 0, start)
+    return sql
+
+
+def quote_known_identifiers(
+    sql: str,
+    relevant_tables: list[dict] | None,
+    dialect: str | None,
+    target_db: str | None = None,
+) -> str:
+    """Deterministically quote every reference in *sql* that exactly matches a
+    known catalog, schema, table or column name which cannot be written bare
+    in *dialect* -- see :func:`auto_ontology.utils.sql_identifiers.needs_quoting`
+    for the one rule that decides it. Two families of names fall under it:
+
+    * names Postgres (and any other dialect with the same unquoted-lowercasing
+      rule) would silently fold, e.g. ``WeatherAndStructure`` to
+      ``weatherandstructure``, failing with "relation does not exist";
+    * names that are not identifiers at all when bare -- a schema
+      ``sales-data``, a database named by a UUID -- which fail to parse here,
+      so no candidate SQL would ever reach the database.
+
+    The model is shown these exact names, already quoted, in the AVAILABLE
+    TABLES/COLUMNS prompt section (``formatters_util.qualify_table`` applies
+    the same rule) — but that competes against its dominant prior from the
+    mostly-plain rest of the schema corpus and loses often enough to be worth
+    enforcing deterministically, rather than relying on compliance or on a
+    failed execution + LLM reconstruction round-trip to catch it after the
+    fact (see ``sql_reconstruction.py``, which still exists as a fallback for
+    anything this misses — e.g. an identifier not in ``relevant_tables`` at
+    all).
 
     Only ever *adds* quoting to an identifier that already exactly matches a
     known real name — never renames or case-corrects a wrong reference; a
@@ -284,27 +372,23 @@ def quote_known_mixed_case_identifiers(
     different problem (a genuinely wrong column) this function has no basis
     to fix.
 
+    *target_db* stands in for a table that carries no ``database_name`` of its
+    own, as it does in the prompt formatters.
+
     No-op (returns *sql* unchanged) when *relevant_tables* is empty, when
-    none of its table/column names contain an uppercase letter (the common
-    case — checked before any parsing), or when *sql* doesn't parse.
+    none of its names need quoting (the common case — checked before any
+    parsing), or when *sql* still doesn't parse.
     """
     if not relevant_tables or not sql or not sql.strip():
         return sql
 
-    mixed_case_tables: dict[str, str] = {}
-    mixed_case_columns: dict[str, str] = {}
-    for table in relevant_tables:
-        name = table.get("name") if isinstance(table, dict) else None
-        if name and any(ch.isupper() for ch in name):
-            mixed_case_tables[name.lower()] = name
-        columns = table.get("columns") if isinstance(table, dict) else None
-        if isinstance(columns, list):
-            for col in columns:
-                col_name = col.get("name") if isinstance(col, dict) else None
-                if col_name and any(ch.isupper() for ch in col_name):
-                    mixed_case_columns[col_name.lower()] = col_name
-    if not mixed_case_tables and not mixed_case_columns:
+    qualifiers, tables, columns, paths = _known_identifiers(
+        relevant_tables, dialect, target_db
+    )
+    if not (qualifiers or tables or columns):
         return sql
+
+    sql = _quote_bare_table_paths(sql, paths, dialect)
 
     try:
         tree = sqlglot.parse_one(sql, read=dialect or None)
@@ -313,24 +397,28 @@ def quote_known_mixed_case_identifiers(
     if tree is None:
         return sql
 
+    # A column's own table qualifier is left alone: it may be an alias.
+    slots = (
+        (exp.Table, "this", tables),
+        (exp.Table, "db", qualifiers),
+        (exp.Table, "catalog", qualifiers),
+        (exp.Column, "this", columns),
+        (exp.Column, "db", qualifiers),
+        (exp.Column, "catalog", qualifiers),
+    )
     changed = False
-    for table_node in tree.find_all(exp.Table):
-        ident = table_node.this
-        if not isinstance(ident, exp.Identifier) or ident.args.get("quoted"):
+    for node_type, slot, known in slots:
+        if not known:
             continue
-        real = mixed_case_tables.get((ident.this or "").lower())
-        if real and ident.this == real:
-            table_node.set("this", exp.to_identifier(real, quoted=True))
-            changed = True
-
-    for col_node in tree.find_all(exp.Column):
-        ident = col_node.this
-        if not isinstance(ident, exp.Identifier) or ident.args.get("quoted"):
-            continue
-        real = mixed_case_columns.get((ident.this or "").lower())
-        if real and ident.this == real:
-            col_node.set("this", exp.to_identifier(real, quoted=True))
-            changed = True
+        for node in tree.find_all(node_type):
+            ident = node.args.get(slot)
+            if (
+                isinstance(ident, exp.Identifier)
+                and not ident.args.get("quoted")
+                and ident.this in known
+            ):
+                node.set(slot, exp.to_identifier(ident.this, quoted=True))
+                changed = True
 
     if not changed:
         return sql
@@ -804,16 +892,19 @@ class SQLValidationAgent(BaseAgent):
         # execution (see the graph: construct_sql_from_candidates,
         # construct_sql_not_from_snippets, and reconstruct_sql all route
         # here), so this is the single choke point to deterministically fix
-        # up unquoted mixed-case identifiers regardless of which path
-        # produced the SQL — see quote_known_mixed_case_identifiers for why
-        # this can't just be left to the prompt/model.
-        quoted_sql = quote_known_mixed_case_identifiers(
-            response.sql_code, path_state.get("relevant_tables"), degenerate_dialect
+        # up known identifiers written without the quotes they need,
+        # regardless of which path produced the SQL — see
+        # quote_known_identifiers for why this can't just be left to the
+        # prompt/model.
+        quoted_sql = quote_known_identifiers(
+            response.sql_code,
+            path_state.get("relevant_tables"),
+            degenerate_dialect,
+            path_state.get("target_db"),
         )
         if quoted_sql != response.sql_code:
             self.logger.info(
-                "Quoted known mixed-case identifier(s) in the generated SQL "
-                "before validation"
+                "Quoted known identifier(s) in the generated SQL before validation"
             )
             response.sql_code = quoted_sql
             path_state["sql_generation_result"] = response

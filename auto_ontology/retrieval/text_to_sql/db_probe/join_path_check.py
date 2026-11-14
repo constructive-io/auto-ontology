@@ -809,7 +809,7 @@ def try_self_apply_missing_bridge_fixes(
                 # quotes its identifiers: hub_table is a table this self-apply
                 # is introducing for the first time, not one already present
                 # in relevant_tables — so the "Re-run
-                # quote_known_mixed_case_identifiers" pass after self-apply
+                # quote_known_identifiers" pass after self-apply
                 # (join_path_check.py agent, right below this call site)
                 # has no metadata for it and can't fix its casing after the
                 # fact. Left unquoted, an unquoted mixed-case name like
